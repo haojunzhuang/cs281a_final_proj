@@ -1,3 +1,15 @@
+"""
+Model1: Fixed Grid with Imputation
+
+Model1 is a baseline algorithm to deal with irregular time series vital signs 
+for predicting in-hospital mortality. It regularizes the first 48 hours of patient data 
+onto a fixed time grid (configurable frequency, e.g., 6-hour buckets). 
+For each time bucket and vital sign (heart rate, respiratory rate, O2 saturation), 
+it extracts three statistics: mean, maximum, and minimum. 
+These aggregated features are then standardized and fed into an XGBoost classifier. 
+The model also include gridding strategy visualizer to show the bucketting.
+"""
+
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
@@ -6,7 +18,6 @@ from sklearn.metrics import (
     accuracy_score, 
     classification_report, 
     confusion_matrix,
-    roc_curve
 )
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
@@ -28,38 +39,46 @@ class Model1:
     
     def regularize_time_series(self, df_vitals, df_patients):
         stay_ids = df_vitals['stay_id'].unique()[:self.n_stay_ids]
+        self.stay_ids = stay_ids
         feature_list = []
+        
+        freq_hours = pd.Timedelta(self.freq).total_seconds() / 3600
+        n_buckets = int(48 / freq_hours)
         
         for stay_id in stay_ids:
             df_stay = df_vitals[df_vitals['stay_id'] == stay_id].copy()
             start_time = df_stay['charttime'].min()
-            end_time = df_stay['charttime'].max()
-            time_grid = pd.date_range(start=start_time, end=end_time, freq=self.freq)
             
-            df_pivot = df_stay.pivot_table(
-                index='charttime', 
-                columns='variable', 
-                values='value', 
-                aggfunc='mean'
-            )
+            df_stay['hours_from_start'] = (df_stay['charttime'] - start_time).dt.total_seconds() / 3600
+            df_stay = df_stay[df_stay['hours_from_start'] < 48]
             
-            df_regular = df_pivot.reindex(time_grid)
-            df_filled = df_regular.ffill().bfill()
-            df_filled = df_filled.fillna(df_filled.mean())
+            df_stay['time_bucket'] = (df_stay['hours_from_start'] / freq_hours).astype(int)
+            df_stay['time_bucket'] = df_stay['time_bucket'].clip(0, n_buckets - 1)
             
             features = {}
             features['stay_id'] = stay_id
             
-            for col in df_filled.columns:
-                features[f'{col}_mean'] = df_filled[col].mean()
-                features[f'{col}_std'] = df_filled[col].std()
-                features[f'{col}_min'] = df_filled[col].min()
-                features[f'{col}_max'] = df_filled[col].max()
-                features[f'{col}_median'] = df_filled[col].median()
-                features[f'{col}_first'] = df_filled[col].iloc[0] if len(df_filled) > 0 else np.nan
-                features[f'{col}_last'] = df_filled[col].iloc[-1] if len(df_filled) > 0 else np.nan
+            vital_vars = df_stay['variable'].unique()
             
-            features['los_hours'] = len(time_grid)
+            for bucket in range(n_buckets):
+                df_bucket = df_stay[df_stay['time_bucket'] == bucket]
+                
+                start_hr = int(bucket * freq_hours)
+                end_hr = int((bucket + 1) * freq_hours)
+                time_label = f'{start_hr}-{end_hr}hr'
+                
+                for var in vital_vars:
+                    df_var = df_bucket[df_bucket['variable'] == var]
+                    
+                    if len(df_var) > 0:
+                        features[f'{var}_{time_label}_mean'] = df_var['value'].mean()
+                        features[f'{var}_{time_label}_max'] = df_var['value'].max()
+                        features[f'{var}_{time_label}_min'] = df_var['value'].min()
+                    else:
+                        features[f'{var}_{time_label}_mean'] = np.nan
+                        features[f'{var}_{time_label}_max'] = np.nan
+                        features[f'{var}_{time_label}_min'] = np.nan
+            
             feature_list.append(features)
         
         features_df = pd.DataFrame(feature_list)
@@ -129,6 +148,88 @@ class Model1:
         
         return results
     
+    def visualize(self, stay_id, df_vitals):
+        df_stay = df_vitals[df_vitals['stay_id'] == stay_id].copy()
+        
+        if len(df_stay) == 0:
+            print(f"No data found for stay_id {stay_id}")
+            return
+        
+        available_vars = df_stay['variable'].unique()
+        print(f"Available variables for stay_id {stay_id}: {available_vars}")
+        
+        vital_vars = available_vars[:3] if len(available_vars) >= 3 else available_vars
+        
+        if len(vital_vars) == 0:
+            print(f"No variables found for stay_id {stay_id}")
+            return
+        
+        start_time = df_stay['charttime'].min()
+        df_stay['hours_from_start'] = (df_stay['charttime'] - start_time).dt.total_seconds() / 3600
+        df_stay = df_stay[df_stay['hours_from_start'] < 48]
+        
+        freq_hours = pd.Timedelta(self.freq).total_seconds() / 3600
+        n_buckets = int(48 / freq_hours)
+        df_stay['time_bucket'] = (df_stay['hours_from_start'] / freq_hours).astype(int)
+        df_stay['time_bucket'] = df_stay['time_bucket'].clip(0, n_buckets - 1)
+        
+        fig, axes = plt.subplots(len(vital_vars), 1, figsize=(14, 4 * len(vital_vars)))
+        if len(vital_vars) == 1:
+            axes = [axes]
+        fig.suptitle(f'Data Gridding Strategy for Stay ID: {stay_id}', fontsize=16, fontweight='bold')
+        
+        for idx, var_name in enumerate(vital_vars):
+            ax = axes[idx]
+            df_var = df_stay[df_stay['variable'] == var_name]
+            
+            if len(df_var) == 0:
+                ax.text(0.5, 0.5, f'No data available for {var_name}', 
+                       ha='center', va='center', transform=ax.transAxes, fontsize=12)
+                ax.set_xlim(0, 48)
+                continue
+            
+            ax.scatter(df_var['hours_from_start'], df_var['value'], 
+                      alpha=0.6, s=50, color='steelblue', label='Raw measurements', zorder=3)
+            
+            for bucket in range(n_buckets):
+                bucket_start = bucket * freq_hours
+                bucket_end = (bucket + 1) * freq_hours
+                
+                ax.axvspan(bucket_start, bucket_end, 
+                          alpha=0.1 if bucket % 2 == 0 else 0.05, 
+                          color='gray', zorder=1)
+                
+                df_bucket = df_var[df_var['time_bucket'] == bucket]
+                
+                if len(df_bucket) > 0:
+                    mean_val = df_bucket['value'].mean()
+                    max_val = df_bucket['value'].max()
+                    min_val = df_bucket['value'].min()
+                    
+                    bucket_center = (bucket_start + bucket_end) / 2
+                    
+                    ax.plot([bucket_start, bucket_end], [mean_val, mean_val], 
+                           'r-', linewidth=2, alpha=0.7, zorder=2)
+                    ax.plot([bucket_start, bucket_end], [max_val, max_val], 
+                           'g--', linewidth=1.5, alpha=0.6, zorder=2)
+                    ax.plot([bucket_start, bucket_end], [min_val, min_val], 
+                           'orange', linestyle='--', linewidth=1.5, alpha=0.6, zorder=2)
+            
+            for bucket in range(n_buckets + 1):
+                bucket_edge = bucket * freq_hours
+                if bucket_edge <= 48:
+                    ax.axvline(bucket_edge, color='black', linestyle='-', linewidth=1, alpha=0.3, zorder=2)
+            
+            ax.set_xlabel('Hours from start', fontsize=11)
+            ax.set_ylabel(var_name, fontsize=11)
+            ax.set_xlim(0, 48)
+            ax.grid(True, alpha=0.3, zorder=0)
+            ax.legend(['Raw measurements', 'Mean', 'Max', 'Min'], 
+                     loc='upper right', fontsize=9)
+        
+        plt.tight_layout()
+        plt.show()
+    
     def plot_feature_importance(self, top_n=20):
         if self.feature_names is None:
             print("Model must be trained first")
@@ -140,8 +241,6 @@ class Model1:
         }).sort_values('importance', ascending=False)
 
         top_features = importance_df.head(top_n)
-        
-        import matplotlib.pyplot as plt
 
         plt.figure(figsize=(10, 6))
         plt.barh(top_features['feature'][::-1], top_features['importance'][::-1])
